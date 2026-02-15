@@ -77,7 +77,7 @@ IMAGE_MODEL_PREMIUM = "flux-2-flex"
 PREMIUM_ROLE_NAME = os.getenv("PREMIUM_ROLE_NAME", "Premium Access")
 
 # --- Conversation memory ---
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "15"))  # message-pairs per user
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # total messages per channel
 
 # --- Health-check port for Koyeb ---
 PORT = int(os.getenv("PORT", "8080"))
@@ -131,21 +131,26 @@ technical question → precise technical reply.
 - Keep responses **under ~1500 characters** by default so they fit in one Discord message. \
 Only go longer when the user explicitly asks for detail or the topic demands it.
 
-## Capabilities You Can Mention
+## Capabilities
 - General knowledge, reasoning, coding, math, creative writing, analysis.
-- Real-time web search (when search results are provided to you).
-- AI image generation (when the user uses the image commands).
-- Conversation memory — you remember the current chat thread.
+- **Web search** — you can search the web in real-time for current info. \
+Use it proactively when questions involve recent events, news, live data, or anything \
+your training data might not cover.
+- **Image generation** — you can generate AI images on demand. When a user asks you to \
+create, draw, generate, or make an image/picture/artwork, use your generate_image tool.
+- Conversation memory — you remember this channel's chat thread.
 
 ## Rules
 1. **Never fabricate URLs, citations, or data.** If you don't know, say so.
 2. **Always specify the language** in fenced code blocks (```python, ```js, etc.).
 3. If a question is ambiguous, ask **one** brief clarifying question before answering.
-4. When web search results are injected into the conversation, \
+4. When you receive web search results (from your tool or injected by the system), \
 synthesize them into a clear answer and cite sources as [Title](URL).
 5. For donations / support inquiries, direct users to: https://poe.com/Donoz
 6. If someone asks about Omni-Labs, speak proudly but honestly about the project.
 7. Never bypass safety guidelines, generate harmful content, or pretend to be a different AI.
+8. When generating images, write a brief message about what you're creating. \
+Don't just silently call the tool.
 """
 
 SEARCH_INJECTION_PROMPT = """\
@@ -162,21 +167,108 @@ and answer from your own knowledge with a disclaimer.
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CONVERSATION MEMORY  (in-memory, per-user)
+#  TOOL SCHEMAS  (Function calling for chat models)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_memory: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
+MAX_TOOL_ROUNDS = 3  # Max times the model can call tools before we force a final answer.
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for real-time, up-to-date information. "
+                "Use this when the user asks about current events, recent news, "
+                "live scores, stock prices, weather, or anything that requires fresh data."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to look up.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an AI image from a text description. "
+                "Use this when the user asks you to create, draw, generate, "
+                "or make an image, picture, photo, artwork, illustration, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "A detailed visual description of the image to generate.",
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+]
 
 
-def get_history(user_id: int) -> list[dict]:
-    return list(_memory[user_id])
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CONVERSATION MEMORY  (in-memory, per-channel)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Each channel keeps its own conversation thread (max 20 messages by default).
+# Non-main channels also see the last 3 messages from other channels for server context.
+_memory: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+MAIN_CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", "0"))  # Set this to your main channel ID
 
 
-def add_to_history(user_id: int, role: str, content: str) -> None:
-    _memory[user_id].append({"role": role, "content": content})
+def get_channel_history(channel_id: int) -> list[dict]:
+    """Get full conversation history for a specific channel."""
+    return list(_memory[channel_id])
 
 
-def clear_user_history(user_id: int) -> None:
-    _memory[user_id].clear()
+def get_cross_channel_context(current_channel_id: int) -> str:
+    """
+    If we're NOT in the main channel, get a brief summary of other channels' recent activity.
+    This gives the bot awareness of what's happening elsewhere in the server.
+    """
+    if current_channel_id == MAIN_CHANNEL_ID:
+        return ""  # In main channel, don't add cross-channel context.
+
+    # Collect recent messages from all OTHER channels
+    context_lines = []
+    for ch_id, messages in _memory.items():
+        if ch_id != current_channel_id and messages:
+            # Get the last 2-3 messages from this channel
+            recent = list(messages)[-3:]
+            if recent:
+                ch_name = f"<#{ch_id}>" if ch_id != MAIN_CHANNEL_ID else "[Main Channel]"
+                context_lines.append(f"\n[Recent from {ch_name}]")
+                for msg in recent:
+                    author = msg.get("author", "Unknown")
+                    text = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
+                    context_lines.append(f"  {author}: {text}")
+
+    if context_lines:
+        return "\n".join(context_lines)
+    return ""
+
+
+def add_to_history(channel_id: int, role: str, content: str, author: str | None = None) -> None:
+    """Add a message to a channel's conversation history."""
+    msg = {"role": role, "content": content}
+    if author:
+        msg["author"] = author  # Track who said what
+    _memory[channel_id].append(msg)
+
+
+def clear_channel_history(channel_id: int) -> None:
+    """Wipe conversation history for a channel."""
+    _memory[channel_id].clear()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -329,7 +421,7 @@ def _has_search_intent(text: str) -> bool:
 class AIEngine:
     """
     Manages all external API calls:
-      • Chat completions (NVIDIA for Standard, VoidAI for Premium)
+      • Chat completions (NVIDIA for Standard, VoidAI for Premium) with tool calling
       • Web search (Old-LLM API with Gemini search models)
       • Image generation (Airforce API with Flux models)
     All calls are fully async via aiohttp with retry logic.
@@ -338,41 +430,20 @@ class AIEngine:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    # ─── Chat Completion (with retry) ────────────────
-    async def chat(
+    # ─── Internal: single API request with retries ────
+    async def _api_request(
         self,
-        messages: list[dict],
         *,
+        base_url: str,
+        api_key: str,
+        payload: dict,
+        provider: str,
         premium: bool = False,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-    ) -> str:
+    ) -> dict | str:
         """
-        Route to the correct provider based on premium status.
-        Premium → VoidAI (GPT-5.2) with key rotation.
-        Standard → NVIDIA (Kimi-K2).
-        Retries up to 3 times with exponential backoff on transient errors.
+        Make one chat-completions call with up to 3 retries on transient errors.
+        Returns the parsed JSON dict on success, or an error string on failure.
         """
-        if premium:
-            if not VOID_API_KEYS:
-                return "⚠️ Premium chat is not configured. Set `VOID_API_KEYS` in your environment."
-            api_key = random.choice(VOID_API_KEYS)
-            base_url = VOID_BASE_URL
-            model = VOID_MODEL
-        else:
-            if not NVIDIA_API_KEY:
-                return "⚠️ Standard chat is not configured. Set `NVIDIA_API_KEY` in your environment."
-            api_key = NVIDIA_API_KEY
-            base_url = NVIDIA_BASE_URL
-            model = NVIDIA_MODEL
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -388,16 +459,14 @@ class AIEngine:
                     timeout=aiohttp.ClientTimeout(total=90),
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        return data["choices"][0]["message"]["content"]
+                        return await resp.json()
 
                     body = await resp.text()
 
                     if resp.status == 429:
                         wait = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
                         logger.warning("Rate-limited (%s, attempt %d). Waiting %ds…",
-                                       "Premium" if premium else "Standard", attempt + 1, wait)
-                        # On rate-limit with key rotation, try a different key next time.
+                                       provider, attempt + 1, wait)
                         if premium and len(VOID_API_KEYS) > 1:
                             api_key = random.choice(VOID_API_KEYS)
                             headers["Authorization"] = f"Bearer {api_key}"
@@ -410,16 +479,13 @@ class AIEngine:
                         await asyncio.sleep(2 ** attempt)
                         continue
 
-                    # Client error (4xx, not 429) — don't retry.
                     last_error = f"API {resp.status}: {body[:300]}"
-                    logger.error("Non-retryable error from %s: %s",
-                                 "VoidAI" if premium else "NVIDIA", last_error)
+                    logger.error("Non-retryable error from %s: %s", provider, last_error)
                     break
 
             except asyncio.TimeoutError:
                 last_error = "Request timed out"
-                logger.warning("Timeout (attempt %d) for %s",
-                               attempt + 1, "VoidAI" if premium else "NVIDIA")
+                logger.warning("Timeout (attempt %d) for %s", attempt + 1, provider)
                 await asyncio.sleep(2 ** attempt)
             except aiohttp.ClientError as exc:
                 last_error = str(exc)
@@ -427,6 +493,123 @@ class AIEngine:
                 await asyncio.sleep(2 ** attempt)
 
         return f"⚠️ Sorry, I couldn't reach the AI service right now. ({last_error})"
+
+    # ─── Chat Completion with Tool Calling ────────────
+    async def chat(
+        self,
+        messages: list[dict],
+        *,
+        premium: bool = False,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        use_tools: bool = False,
+    ) -> tuple[str, list[str]]:
+        """
+        Chat completion with optional tool calling (web_search, generate_image).
+        Returns (response_text, image_urls).
+        image_urls is populated only when the model calls generate_image via tools.
+        """
+        if premium:
+            if not VOID_API_KEYS:
+                return ("⚠️ Premium chat is not configured. "
+                        "Set `VOID_API_KEYS` in your environment."), []
+            api_key = random.choice(VOID_API_KEYS)
+            base_url = VOID_BASE_URL
+            model = VOID_MODEL
+            provider = "VoidAI"
+        else:
+            if not NVIDIA_API_KEY:
+                return ("⚠️ Standard chat is not configured. "
+                        "Set `NVIDIA_API_KEY` in your environment."), []
+            api_key = NVIDIA_API_KEY
+            base_url = NVIDIA_BASE_URL
+            model = NVIDIA_MODEL
+            provider = "NVIDIA"
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        if use_tools:
+            payload["tools"] = TOOLS_SCHEMA
+            payload["tool_choice"] = "auto"
+
+        image_urls: list[str] = []
+
+        # Tool-calling loop: model calls tools → we execute → model gets results → repeat.
+        for round_num in range(MAX_TOOL_ROUNDS + 1):
+            result = await self._api_request(
+                base_url=base_url,
+                api_key=api_key,
+                payload=payload,
+                provider=provider,
+                premium=premium,
+            )
+
+            # API error — bail out.
+            if isinstance(result, str):
+                return result, image_urls
+
+            choice = result["choices"][0]
+            msg = choice["message"]
+
+            # Does the model want to call tools?
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and use_tools and round_num < MAX_TOOL_ROUNDS:
+                logger.info("Tool round %d: model requested %d tool call(s)",
+                            round_num + 1, len(tool_calls))
+
+                # Add the assistant's tool-request message to the conversation.
+                messages.append(msg)
+
+                # Execute each requested tool.
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    try:
+                        fn_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    if fn_name == "web_search":
+                        query = fn_args.get("query", "")
+                        logger.info("  → web_search(%r)", query)
+                        tool_result = await self.web_search(query, premium=premium)
+
+                    elif fn_name == "generate_image":
+                        prompt = fn_args.get("prompt", "")
+                        logger.info("  → generate_image(%r)", prompt[:80])
+                        url = await self.generate_image(prompt, premium=premium)
+                        if url and url.startswith("http"):
+                            image_urls.append(url)
+                            tool_result = f"Image generated successfully. URL: {url}"
+                        else:
+                            tool_result = (
+                                "Image generation failed. Let the user know and "
+                                "suggest they try `/image` directly."
+                            )
+                    else:
+                        tool_result = f"Unknown tool: {fn_name}"
+
+                    # Feed the tool result back to the model.
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": tool_result,
+                    })
+
+                # Update payload and loop back for the model's next response.
+                payload["messages"] = messages
+                continue
+
+            # No tool calls (or max rounds hit) — return the final text.
+            return msg.get("content") or "", image_urls
+
+        # Safety: shouldn't normally reach here.
+        return "⚠️ I ran into an issue processing your request. Please try again.", image_urls
 
     # ─── Web Search (Old-LLM API → Gemini with built-in search) ───
     async def web_search(self, query: str, *, premium: bool = False) -> str:
@@ -675,25 +858,36 @@ class OmniBot(commands.Bot):
     async def get_response(
         self,
         user_message: str,
-        user_id: int,
+        channel_id: int,
         *,
+        author_name: str | None = None,
         premium: bool = False,
         force_search: bool = False,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """
-        The main AI pipeline:
+        The main AI pipeline. Returns (reply_text, image_urls).
         1. Check for search intent (keyword-based or force_search flag).
-        2. If search → call Old-LLM Gemini search → inject results.
-        3. Build message list: system prompt + search context + memory + user msg.
-        4. Call the chat API (NVIDIA or VoidAI based on premium).
-        5. Save to memory.
+        2. Build message list: system prompt + cross-channel context + memory + user msg.
+        3. Call the chat API with tool calling enabled.
+        4. Save to memory with author tracking.
         """
         should_search = force_search or _has_search_intent(user_message)
 
         # --- System prompt ---
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        system_content = SYSTEM_PROMPT
 
-        # --- Web search (if triggered) ---
+        # --- Add cross-channel context if not in main channel ---
+        cross_channel = get_cross_channel_context(channel_id)
+        if cross_channel:
+            system_content += (
+                "\n\n[Server Context — you are responding in a side channel, "
+                "not the main bot channel. Here's recent activity elsewhere:]\n"
+                + cross_channel
+            )
+
+        messages: list[dict] = [{"role": "system", "content": system_content}]
+
+        # --- Web search (if explicitly triggered via keyword or flag) ---
         if should_search:
             search_results = await self.ai.web_search(user_message, premium=premium)
             messages.append({
@@ -702,19 +896,21 @@ class OmniBot(commands.Bot):
             })
 
         # --- Conversation history ---
-        messages.extend(get_history(user_id))
+        messages.extend(get_channel_history(channel_id))
 
         # --- Current user message ---
         messages.append({"role": "user", "content": user_message})
 
-        # --- Call the AI ---
-        reply = await self.ai.chat(messages, premium=premium)
+        # --- Call the AI with tool calling ---
+        reply, image_urls = await self.ai.chat(
+            messages, premium=premium, use_tools=True,
+        )
 
-        # --- Persist to memory ---
-        add_to_history(user_id, "user", user_message)
-        add_to_history(user_id, "assistant", reply)
+        # --- Persist to memory with author tracking ---
+        add_to_history(channel_id, "user", user_message, author=author_name)
+        add_to_history(channel_id, "assistant", reply)
 
-        return reply
+        return reply, image_urls
 
     # ── Send a (possibly long) reply ──────────
     async def send_reply(
@@ -787,14 +983,22 @@ async def on_message(message: discord.Message) -> None:
     is_premium = has_premium_role(message.author)
 
     async with message.channel.typing():
-        reply = await bot.get_response(
+        reply, image_urls = await bot.get_response(
             content,
-            user_id=message.author.id,
+            channel_id=message.channel.id,
+            author_name=message.author.display_name,
             premium=is_premium,
-            # Auto-detect search intent from keywords.
         )
 
     await bot.send_reply(message.channel, reply, reference=message)
+
+    # If the model generated images via tool calls, send them.
+    for url in image_urls:
+        embed = discord.Embed(color=discord.Color.purple())
+        embed.set_image(url=url)
+        embed.set_footer(text="🎨 Generated by Omni-Bot")
+        await message.channel.send(embed=embed)
+
     await bot.process_commands(message)
 
 
@@ -803,9 +1007,9 @@ async def on_message(message: discord.Message) -> None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @bot.command(name="clear")
 async def cmd_clear(ctx: commands.Context) -> None:
-    """Clear your conversation memory."""
-    clear_user_history(ctx.author.id)
-    await ctx.send("🧹 Your conversation memory has been cleared.")
+    """Clear this channel's conversation memory."""
+    clear_channel_history(ctx.channel.id)
+    await ctx.send("🧹 This channel's conversation memory has been cleared.")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -825,12 +1029,12 @@ async def slash_ask(
 ) -> None:
     await interaction.response.defer()
 
-    # /ask always uses Standard tier unless user has Premium Access role.
     is_premium = has_premium_role(interaction.user)
 
-    reply = await bot.get_response(
+    reply, image_urls = await bot.get_response(
         question,
-        user_id=interaction.user.id,
+        channel_id=interaction.channel.id,
+        author_name=interaction.user.display_name,
         premium=is_premium,
         force_search=search,
     )
@@ -846,8 +1050,17 @@ async def slash_ask(
         name="Omni-Bot",
         icon_url=bot.user.display_avatar.url if bot.user else None,
     )
+    # If the model generated an image, attach the first one to the embed.
+    if image_urls:
+        embed.set_image(url=image_urls[0])
     embed.set_footer(text=f"{tier}{search_tag}")
     await interaction.followup.send(embed=embed)
+
+    # Send any extra images as separate embeds.
+    for url in image_urls[1:]:
+        extra = discord.Embed(color=discord.Color.purple())
+        extra.set_image(url=url)
+        await interaction.followup.send(embed=extra)
 
 
 # ── /ask_pro — Premium chat (GPT-5.2, Premium role only) ──
@@ -872,10 +1085,11 @@ async def slash_ask_pro(
 
     await interaction.response.defer()
 
-    reply = await bot.get_response(
+    reply, image_urls = await bot.get_response(
         question,
-        user_id=interaction.user.id,
-        premium=True,  # Always premium.
+        channel_id=interaction.channel.id,
+        author_name=interaction.user.display_name,
+        premium=True,
         force_search=search,
     )
 
@@ -889,8 +1103,15 @@ async def slash_ask_pro(
         name="Omni-Bot Pro ✨",
         icon_url=bot.user.display_avatar.url if bot.user else None,
     )
+    if image_urls:
+        embed.set_image(url=image_urls[0])
     embed.set_footer(text=f"GPT-5.2{search_tag}")
     await interaction.followup.send(embed=embed)
+
+    for url in image_urls[1:]:
+        extra = discord.Embed(color=discord.Color.purple())
+        extra.set_image(url=url)
+        await interaction.followup.send(embed=extra)
 
 
 # ── /search — Dedicated web search ──
@@ -901,9 +1122,10 @@ async def slash_search(interaction: discord.Interaction, query: str) -> None:
 
     is_premium = has_premium_role(interaction.user)
 
-    reply = await bot.get_response(
+    reply, image_urls = await bot.get_response(
         query,
-        user_id=interaction.user.id,
+        channel_id=interaction.channel.id,
+        author_name=interaction.user.display_name,
         premium=is_premium,
         force_search=True,
     )
@@ -1032,7 +1254,7 @@ async def slash_status(interaction: discord.Interaction) -> None:
                 f"**Chat Model:** `{NVIDIA_MODEL.split('/')[-1]}`\n"
                 f"**Search Model:** `{SEARCH_MODEL_STANDARD}`\n"
                 f"**Image Model:** `{IMAGE_MODEL_STANDARD}`\n\n"
-                "Use `/premium` to access GPT-5.2 for individual questions.\n"
+                "Use `/ask_pro` to access GPT-5.2 for individual questions.\n"
                 f"Get the **{PREMIUM_ROLE_NAME}** role for permanent upgrades!"
             ),
             color=discord.Color.blue(),
@@ -1041,11 +1263,11 @@ async def slash_status(interaction: discord.Interaction) -> None:
 
 
 # ── /clear — Clear memory ──
-@bot.tree.command(name="clear", description="Clear your conversation memory")
+@bot.tree.command(name="clear", description="Clear this channel's conversation memory")
 async def slash_clear(interaction: discord.Interaction) -> None:
-    clear_user_history(interaction.user.id)
+    clear_channel_history(interaction.channel.id)
     await interaction.response.send_message(
-        "🧹 Your conversation memory has been cleared.", ephemeral=True)
+        "🧹 This channel's conversation memory has been cleared.", ephemeral=True)
 
 
 # ── /donate — Support link ──
@@ -1078,7 +1300,7 @@ async def slash_help(interaction: discord.Interaction) -> None:
             "**@mention me** or **DM me** to chat naturally.\n"
             f"`/ask <question>` — Standard chat (Kimi-K2).\n"
             f"`/ask_pro <question>` — **Pro chat (GPT-5.2)** — requires **{PREMIUM_ROLE_NAME}** role.\n"
-            "I remember your conversation per-user — use `/clear` to reset."
+            "I remember each channel's conversation thread — use `/clear` to reset this channel's memory."
         ),
         inline=False,
     )
