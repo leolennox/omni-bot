@@ -430,16 +430,45 @@ class AIEngine:
         logger.info("API call → %s | model: %s | provider: %s",
                      url, payload.get("model", "?"), provider)
 
+        # Force streaming — some providers (e.g. VoidAI) only support stream mode.
+        payload["stream"] = True
+
         for attempt in range(3):
             try:
                 async with self.session.post(
                     url,
                     json=payload,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=90),
+                    timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status == 200:
-                        return await resp.json()
+                        # Parse SSE stream and accumulate the full response.
+                        full_content = ""
+                        async for raw_line in resp.content:
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line or line == "data: [DONE]":
+                                continue
+                            if line.startswith("data: "):
+                                try:
+                                    chunk = json.loads(line[6:])
+                                    choices = chunk.get("choices", [])
+                                    if choices:
+                                        delta = choices[0].get("delta", {})
+                                        content = delta.get("content")
+                                        if content:
+                                            full_content += content
+                                except json.JSONDecodeError:
+                                    continue
+
+                        # Return in the same dict format the rest of the code expects.
+                        return {
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": full_content,
+                                }
+                            }]
+                        }
 
                     body = await resp.text()
                     logger.error("API error %d from %s (attempt %d): %s",
@@ -468,7 +497,7 @@ class AIEngine:
                     break
 
             except asyncio.TimeoutError:
-                last_error = "Request timed out (90s)"
+                last_error = "Request timed out (120s)"
                 logger.warning("Timeout (attempt %d) for %s", attempt + 1, provider)
                 await asyncio.sleep(2 ** attempt)
             except aiohttp.ClientError as exc:
@@ -477,6 +506,23 @@ class AIEngine:
                 await asyncio.sleep(2 ** attempt)
 
         return f"⚠️ Sorry, I couldn't reach the AI service right now. ({last_error})"
+
+    # ─── Resolve which provider to use ─────────
+    def _resolve_provider(self, premium: bool) -> tuple[str, str, str, str] | str:
+        """
+        Pick (api_key, base_url, model, provider_name) for the given tier.
+        Returns an error string if the tier isn't configured.
+        """
+        if premium:
+            if not VOID_API_KEYS:
+                return "⚠️ Premium chat is not configured."
+            return (random.choice(VOID_API_KEYS), VOID_BASE_URL,
+                    VOID_MODEL, "VoidAI")
+        else:
+            if not NVIDIA_API_KEY:
+                return "⚠️ Standard chat is not configured."
+            return (NVIDIA_API_KEY, NVIDIA_BASE_URL,
+                    NVIDIA_MODEL, "NVIDIA")
 
     # ─── Chat Completion with Text-Based Tool Detection ────────────
     async def chat(
@@ -489,39 +535,32 @@ class AIEngine:
         use_tools: bool = False,
     ) -> tuple[str, list[str]]:
         """
-        Chat completion with text-based tool detection.
+        Chat completion with text-based tool detection and automatic fallback.
         Returns (response_text, image_urls).
 
+        If the primary provider fails, automatically falls back to the other tier.
         The model can include <<SEARCH>>query<</SEARCH>> or <<IMAGE>>prompt<</IMAGE>>
-        tags in its response. This method detects them, executes the tools, and
-        (for search) re-calls the model with results so it can write a final answer.
+        tags in its response for tool use.
         """
-        if premium:
-            if not VOID_API_KEYS:
-                return ("⚠️ Premium chat is not configured. "
-                        "Set `VOID_API_KEYS` in your environment."), []
-            api_key = random.choice(VOID_API_KEYS)
-            base_url = VOID_BASE_URL
-            model = VOID_MODEL
-            provider = "VoidAI"
-        else:
-            if not NVIDIA_API_KEY:
-                return ("⚠️ Standard chat is not configured. "
-                        "Set `NVIDIA_API_KEY` in your environment."), []
-            api_key = NVIDIA_API_KEY
-            base_url = NVIDIA_BASE_URL
-            model = NVIDIA_MODEL
-            provider = "NVIDIA"
+        resolved = self._resolve_provider(premium)
+        if isinstance(resolved, str):
+            return resolved, []
+        api_key, base_url, model, provider = resolved
 
-        payload = {
+        # Keep the payload minimal — some providers (e.g. VoidAI) reject
+        # extra parameters like temperature/max_tokens with 500 errors.
+        payload: dict = {
             "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
+            "messages": list(messages),  # Copy so fallback can reuse original.
         }
+        # Only include optional params if they differ from defaults.
+        if temperature != 0.7:
+            payload["temperature"] = temperature
+        if max_tokens != 2048:
+            payload["max_tokens"] = max_tokens
 
         image_urls: list[str] = []
+        fallback_attempted = False
 
         # Tool loop: get response → check for tool tags → execute → re-call if needed.
         for round_num in range(MAX_TOOL_ROUNDS + 1):
@@ -533,9 +572,33 @@ class AIEngine:
                 premium=premium,
             )
 
-            # API error — bail out.
+            # API error — try fallback to the other provider before giving up.
+            if isinstance(result, str) and not fallback_attempted:
+                fallback_tier = not premium
+                fallback = self._resolve_provider(fallback_tier)
+                if not isinstance(fallback, str):
+                    fb_key, fb_url, fb_model, fb_provider = fallback
+                    logger.warning(
+                        "%s failed — falling back to %s (%s)…",
+                        provider, fb_provider, fb_model,
+                    )
+                    api_key, base_url, model, provider = fb_key, fb_url, fb_model, fb_provider
+                    payload["model"] = model
+                    payload["messages"] = list(messages)  # Reset messages.
+                    fallback_attempted = True
+                    # Retry with fallback (don't increment round_num).
+                    result = await self._api_request(
+                        base_url=base_url,
+                        api_key=api_key,
+                        payload=payload,
+                        provider=provider,
+                        premium=fallback_tier,
+                    )
+
+            # Still failed after fallback — bail out with a clean message.
             if isinstance(result, str):
-                return result, image_urls
+                return ("⚠️ Sorry, I couldn't reach the AI service right now. "
+                        "Please try again in a moment."), image_urls
 
             reply_text = result["choices"][0]["message"].get("content") or ""
 
