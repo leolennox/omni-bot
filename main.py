@@ -450,10 +450,14 @@ class AIEngine:
         }
 
         last_error = ""
+        url = f"{base_url}/chat/completions"
+        logger.info("API call → %s | model: %s | provider: %s",
+                     url, payload.get("model", "?"), provider)
+
         for attempt in range(3):
             try:
                 async with self.session.post(
-                    f"{base_url}/chat/completions",
+                    url,
                     json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=90),
@@ -462,8 +466,11 @@ class AIEngine:
                         return await resp.json()
 
                     body = await resp.text()
+                    logger.error("API error %d from %s (attempt %d): %s",
+                                 resp.status, provider, attempt + 1, body[:500])
 
                     if resp.status == 429:
+                        last_error = f"Rate-limited (429): {body[:200]}"
                         wait = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
                         logger.warning("Rate-limited (%s, attempt %d). Waiting %ds…",
                                        provider, attempt + 1, wait)
@@ -474,6 +481,7 @@ class AIEngine:
                         continue
 
                     if resp.status >= 500:
+                        last_error = f"Server error ({resp.status}): {body[:200]}"
                         logger.warning("Server error %d (attempt %d). Retrying…",
                                        resp.status, attempt + 1)
                         await asyncio.sleep(2 ** attempt)
@@ -484,7 +492,7 @@ class AIEngine:
                     break
 
             except asyncio.TimeoutError:
-                last_error = "Request timed out"
+                last_error = "Request timed out (90s)"
                 logger.warning("Timeout (attempt %d) for %s", attempt + 1, provider)
                 await asyncio.sleep(2 ** attempt)
             except aiohttp.ClientError as exc:
