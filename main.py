@@ -72,14 +72,9 @@ AIR_BASE_URL = "https://api.airforce/v1/images/generations"
 IMAGE_MODEL_STANDARD = "flux-2-klein-9b"
 IMAGE_MODEL_PREMIUM = "flux-2-flex"
 
-# --- Premium User IDs ---
-# Comma-separated Discord user IDs, e.g. "123456789,987654321"
-_raw_ids = os.getenv("PREMIUM_USER_IDS", "")
-PREMIUM_USER_IDS: set[int] = set()
-for _id in _raw_ids.split(","):
-    _id = _id.strip()
-    if _id.isdigit():
-        PREMIUM_USER_IDS.add(int(_id))
+# --- Premium Access (role-based) ---
+# The Discord role name that grants premium access.
+PREMIUM_ROLE_NAME = os.getenv("PREMIUM_ROLE_NAME", "Premium Access")
 
 # --- Conversation memory ---
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "15"))  # message-pairs per user
@@ -93,6 +88,20 @@ SEARCH_KEYWORDS = [
     "today", "who is", "what happened", "what is happening",
     "recent", "update on", "find out", "google",
 ]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PREMIUM ROLE CHECK
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def has_premium_role(user) -> bool:
+    """
+    Check if a user/member has the Premium Access role.
+    Works with discord.Member (in guilds). Returns False for
+    discord.User objects (DMs) since roles aren't available there.
+    """
+    if not isinstance(user, discord.Member):
+        return False  # DMs — no roles available, default to standard.
+    return any(role.name == PREMIUM_ROLE_NAME for role in user.roles)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -634,8 +643,8 @@ class OmniBot(commands.Bot):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info("Connected to %d guild(s)", len(self.guilds))
-        logger.info("Premium users: %d  |  VoidAI keys: %d  |  Airforce keys: %d",
-                     len(PREMIUM_USER_IDS), len(VOID_API_KEYS), len(AIR_API_KEYS))
+        logger.info("Premium role: '%s'  |  VoidAI keys: %d  |  Airforce keys: %d",
+                     PREMIUM_ROLE_NAME, len(VOID_API_KEYS), len(AIR_API_KEYS))
         await self.change_presence(
             status=discord.Status.online,
             activity=discord.Activity(
@@ -773,8 +782,9 @@ async def on_message(message: discord.Message) -> None:
             "Hey there! 👋 Ask me anything, or try `/ask`, `/search`, or `/imagine`.")
         return
 
-    # Mentions/DMs use the user's premium status.
-    is_premium = message.author.id in PREMIUM_USER_IDS
+    # Mentions/DMs use the user's premium status (role-based).
+    # In DMs, message.author is a User (no roles) → defaults to standard.
+    is_premium = has_premium_role(message.author)
 
     async with message.channel.typing():
         reply = await bot.get_response(
@@ -815,8 +825,8 @@ async def slash_ask(
 ) -> None:
     await interaction.response.defer()
 
-    # /ask always uses Standard tier unless user is premium (auto-upgrade).
-    is_premium = interaction.user.id in PREMIUM_USER_IDS
+    # /ask always uses Standard tier unless user has Premium Access role.
+    is_premium = has_premium_role(interaction.user)
 
     reply = await bot.get_response(
         question,
@@ -840,17 +850,26 @@ async def slash_ask(
     await interaction.followup.send(embed=embed)
 
 
-# ── /premium — Force Premium chat (GPT-5.2) ──
-@bot.tree.command(name="premium", description="Ask Omni-Bot Premium (GPT-5.2)")
+# ── /ask_pro — Premium chat (GPT-5.2, Premium role only) ──
+@bot.tree.command(name="ask_pro", description="Ask Omni-Bot Pro (GPT-5.2 — Premium Access role required)")
 @app_commands.describe(
     question="Your question or prompt",
     search="Enable real-time web search",
 )
-async def slash_premium(
+async def slash_ask_pro(
     interaction: discord.Interaction,
     question: str,
     search: bool = False,
 ) -> None:
+    # Only users with the Premium Access role can use /ask_pro.
+    if not has_premium_role(interaction.user):
+        await interaction.response.send_message(
+            f"🔒 You need the **{PREMIUM_ROLE_NAME}** role to use `/ask_pro`.\n"
+            "Use `/ask` for standard access, or contact the server owner for Premium!",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer()
 
     reply = await bot.get_response(
@@ -867,7 +886,7 @@ async def slash_premium(
         color=discord.Color.gold(),
     )
     embed.set_author(
-        name="Omni-Bot Premium ✨",
+        name="Omni-Bot Pro ✨",
         icon_url=bot.user.display_avatar.url if bot.user else None,
     )
     embed.set_footer(text=f"GPT-5.2{search_tag}")
@@ -880,7 +899,7 @@ async def slash_premium(
 async def slash_search(interaction: discord.Interaction, query: str) -> None:
     await interaction.response.defer()
 
-    is_premium = interaction.user.id in PREMIUM_USER_IDS
+    is_premium = has_premium_role(interaction.user)
 
     reply = await bot.get_response(
         query,
@@ -934,8 +953,8 @@ async def slash_image(
         )
 
 
-# ── /image_flex — Premium image generation (Flux-2-Flex) ──
-@bot.tree.command(name="image_flex", description="Premium Image Gen (Flux-2-Flex)")
+# ── /image_pro — Premium image generation (Flux-2-Flex, Premium role only) ──
+@bot.tree.command(name="image_pro", description="Generate Pro Images (Flux-2-Flex — Premium Access role required)")
 @app_commands.describe(
     prompt="Describe the image you want",
     aspect="Aspect ratio",
@@ -954,12 +973,21 @@ async def slash_image(
         app_commands.Choice(name="2K", value="2k"),
     ],
 )
-async def slash_image_flex(
+async def slash_image_pro(
     interaction: discord.Interaction,
     prompt: str,
     aspect: str = "1:1",
     res: str = "1k",
 ) -> None:
+    # Only users with the Premium Access role can use /image_pro.
+    if not has_premium_role(interaction.user):
+        await interaction.response.send_message(
+            f"🔒 You need the **{PREMIUM_ROLE_NAME}** role to use `/image_pro`.\n"
+            "Use `/image` for standard quality, or contact the server owner for Premium!",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer()
 
     url = await bot.ai.generate_image(
@@ -967,7 +995,7 @@ async def slash_image_flex(
 
     if url and url.startswith("http"):
         embed = discord.Embed(
-            title="🚀 Omni-Labs Premium Flex",
+            title="🚀 Omni-Labs Pro Image",
             description=f"**Prompt:** {prompt[:300]}",
             color=discord.Color.gold(),
         )
@@ -976,7 +1004,7 @@ async def slash_image_flex(
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send(
-            "❌ Premium image generation failed. Please try again.",
+            "❌ Pro image generation failed. Please try again.",
             ephemeral=True,
         )
 
@@ -984,7 +1012,7 @@ async def slash_image_flex(
 # ── /status — Check tier ──
 @bot.tree.command(name="status", description="Check your Omni-Bot subscription tier")
 async def slash_status(interaction: discord.Interaction) -> None:
-    is_prem = interaction.user.id in PREMIUM_USER_IDS
+    is_prem = has_premium_role(interaction.user)
     if is_prem:
         embed = discord.Embed(
             title="🌟 Premium Tier",
@@ -992,7 +1020,8 @@ async def slash_status(interaction: discord.Interaction) -> None:
                 f"**Chat Model:** `{VOID_MODEL}`\n"
                 f"**Search Model:** `{SEARCH_MODEL_PREMIUM}`\n"
                 f"**Image Model:** `{IMAGE_MODEL_PREMIUM}`\n\n"
-                "You have access to the most powerful models available."
+                f"✅ You have the **{PREMIUM_ROLE_NAME}** role — "
+                "enjoy the most powerful models!"
             ),
             color=discord.Color.gold(),
         )
@@ -1004,7 +1033,7 @@ async def slash_status(interaction: discord.Interaction) -> None:
                 f"**Search Model:** `{SEARCH_MODEL_STANDARD}`\n"
                 f"**Image Model:** `{IMAGE_MODEL_STANDARD}`\n\n"
                 "Use `/premium` to access GPT-5.2 for individual questions.\n"
-                "Contact the server owner for permanent Premium access!"
+                f"Get the **{PREMIUM_ROLE_NAME}** role for permanent upgrades!"
             ),
             color=discord.Color.blue(),
         )
@@ -1047,27 +1076,27 @@ async def slash_help(interaction: discord.Interaction) -> None:
         name="💬 Chat",
         value=(
             "**@mention me** or **DM me** to chat naturally.\n"
-            "`/ask <question>` — Quick question (auto-upgrades if you're Premium).\n"
-            "`/premium <question>` — Force GPT-5.2 for any question.\n"
-            "I remember your conversation — use `/clear` to reset."
+            f"`/ask <question>` — Standard chat (Kimi-K2).\n"
+            f"`/ask_pro <question>` — **Pro chat (GPT-5.2)** — requires **{PREMIUM_ROLE_NAME}** role.\n"
+            "I remember your conversation per-user — use `/clear` to reset."
         ),
         inline=False,
     )
     embed.add_field(
         name="🌐 Web Search",
         value=(
-            "`/search <query>` — Search the internet + AI summary.\n"
-            "`/ask <question> search:True` — Any question with search.\n"
-            "I also auto-detect search intent from keywords like "
-            "*\"latest\", \"news\", \"who is\"*, etc."
+            "`/search <query>` — Search + AI synthesis (auto-detects your tier).\n"
+            "`/ask <question> search:True` — Standard search for any question.\n"
+            "`/ask_pro <question> search:True` — Pro search (GPT-5.2 + Gemini-Pro).\n"
+            "**Keywords that auto-trigger search:** latest, news, who is, what happened, today, recent, etc."
         ),
         inline=False,
     )
     embed.add_field(
         name="🎨 Image Generation",
         value=(
-            "`/image <prompt>` — Standard quality (Flux-Klein).\n"
-            "`/image_flex <prompt>` — Premium quality with aspect ratio & resolution controls."
+            "`/image <prompt>` — Standard quality (Flux-Klein) — everyone.\n"
+            f"`/image_pro <prompt>` — **Pro quality (Flux-2-Flex)** with aspect & resolution — requires **{PREMIUM_ROLE_NAME}** role."
         ),
         inline=False,
     )
@@ -1082,8 +1111,7 @@ async def slash_help(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.set_footer(
-        text="Standard: Kimi-K2 + Gemini-Flash + Flux-Klein  •  "
-             "Premium: GPT-5.2 + Gemini-Pro + Flux-Flex")
+        text=f"Standard: Kimi-K2  •  Premium ({PREMIUM_ROLE_NAME} role): GPT-5.2")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
