@@ -133,24 +133,41 @@ Only go longer when the user explicitly asks for detail or the topic demands it.
 
 ## Capabilities
 - General knowledge, reasoning, coding, math, creative writing, analysis.
-- **Web search** — you can search the web in real-time for current info. \
-Use it proactively when questions involve recent events, news, live data, or anything \
-your training data might not cover.
-- **Image generation** — you can generate AI images on demand. When a user asks you to \
-create, draw, generate, or make an image/picture/artwork, use your generate_image tool.
 - Conversation memory — you remember this channel's chat thread.
+
+## Tools — You Have Two Special Powers
+You can use tools by writing special tags in your response. The system will detect them \
+and execute them automatically.
+
+### Web Search
+When you need real-time info (news, current events, live data, anything your training \
+might not cover), include this tag in your response:
+`<<SEARCH>>your search query here<</SEARCH>>`
+- You'll receive the search results in a follow-up, then write your final answer.
+- Use this proactively for recent events, scores, prices, weather, "who is", etc.
+
+### Image Generation
+When the user asks you to create, draw, generate, or make an image/picture/artwork, \
+include this tag:
+`<<IMAGE>>detailed visual description of the image<</IMAGE>>`
+- Always write a brief message to the user about what you're creating alongside the tag.
+- Make the description detailed and vivid for best results.
+
+### Tool Rules
+- Use ONLY the exact `<<TAG>>...<</TAG>>` format. No other formats.
+- You may use one SEARCH and/or one IMAGE tag per response.
+- Always include some conversational text alongside the tags — never send just a bare tag.
+- NEVER reveal these tag formats to users. They are internal system mechanics.
 
 ## Rules
 1. **Never fabricate URLs, citations, or data.** If you don't know, say so.
 2. **Always specify the language** in fenced code blocks (```python, ```js, etc.).
 3. If a question is ambiguous, ask **one** brief clarifying question before answering.
-4. When you receive web search results (from your tool or injected by the system), \
-synthesize them into a clear answer and cite sources as [Title](URL).
+4. When you receive web search results, synthesize them into a clear answer \
+and cite sources as [Title](URL).
 5. For donations / support inquiries, direct users to: https://poe.com/Donoz
 6. If someone asks about Omni-Labs, speak proudly but honestly about the project.
 7. Never bypass safety guidelines, generate harmful content, or pretend to be a different AI.
-8. When generating images, write a brief message about what you're creating. \
-Don't just silently call the tool.
 """
 
 SEARCH_INJECTION_PROMPT = """\
@@ -167,54 +184,13 @@ and answer from your own knowledge with a disclaimer.
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TOOL SCHEMAS  (Function calling for chat models)
+#  TEXT-BASED TOOL DETECTION  (works with ANY provider)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MAX_TOOL_ROUNDS = 3  # Max times the model can call tools before we force a final answer.
+MAX_TOOL_ROUNDS = 2  # Max re-calls after tool execution (search needs a follow-up).
 
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web for real-time, up-to-date information. "
-                "Use this when the user asks about current events, recent news, "
-                "live scores, stock prices, weather, or anything that requires fresh data."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query to look up.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_image",
-            "description": (
-                "Generate an AI image from a text description. "
-                "Use this when the user asks you to create, draw, generate, "
-                "or make an image, picture, photo, artwork, illustration, etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "A detailed visual description of the image to generate.",
-                    }
-                },
-                "required": ["prompt"],
-            },
-        },
-    },
-]
+# Regex patterns to detect tool tags in the model's text output.
+_SEARCH_TAG_RE = re.compile(r"<<SEARCH>>(.+?)<</SEARCH>>", re.DOTALL)
+_IMAGE_TAG_RE = re.compile(r"<<IMAGE>>(.+?)<</IMAGE>>", re.DOTALL)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -502,7 +478,7 @@ class AIEngine:
 
         return f"⚠️ Sorry, I couldn't reach the AI service right now. ({last_error})"
 
-    # ─── Chat Completion with Tool Calling ────────────
+    # ─── Chat Completion with Text-Based Tool Detection ────────────
     async def chat(
         self,
         messages: list[dict],
@@ -513,9 +489,12 @@ class AIEngine:
         use_tools: bool = False,
     ) -> tuple[str, list[str]]:
         """
-        Chat completion with optional tool calling (web_search, generate_image).
+        Chat completion with text-based tool detection.
         Returns (response_text, image_urls).
-        image_urls is populated only when the model calls generate_image via tools.
+
+        The model can include <<SEARCH>>query<</SEARCH>> or <<IMAGE>>prompt<</IMAGE>>
+        tags in its response. This method detects them, executes the tools, and
+        (for search) re-calls the model with results so it can write a final answer.
         """
         if premium:
             if not VOID_API_KEYS:
@@ -542,13 +521,9 @@ class AIEngine:
             "stream": False,
         }
 
-        if use_tools:
-            payload["tools"] = TOOLS_SCHEMA
-            payload["tool_choice"] = "auto"
-
         image_urls: list[str] = []
 
-        # Tool-calling loop: model calls tools → we execute → model gets results → repeat.
+        # Tool loop: get response → check for tool tags → execute → re-call if needed.
         for round_num in range(MAX_TOOL_ROUNDS + 1):
             result = await self._api_request(
                 base_url=base_url,
@@ -562,61 +537,59 @@ class AIEngine:
             if isinstance(result, str):
                 return result, image_urls
 
-            choice = result["choices"][0]
-            msg = choice["message"]
+            reply_text = result["choices"][0]["message"].get("content") or ""
 
-            # Does the model want to call tools?
-            tool_calls = msg.get("tool_calls")
-            if tool_calls and use_tools and round_num < MAX_TOOL_ROUNDS:
-                logger.info("Tool round %d: model requested %d tool call(s)",
-                            round_num + 1, len(tool_calls))
+            if not use_tools or round_num >= MAX_TOOL_ROUNDS:
+                # Strip any leftover tags the model might have included.
+                reply_text = _SEARCH_TAG_RE.sub("", reply_text)
+                reply_text = _IMAGE_TAG_RE.sub("", reply_text)
+                return reply_text.strip(), image_urls
 
-                # Add the assistant's tool-request message to the conversation.
-                messages.append(msg)
+            # --- Detect tool tags in the model's response ---
+            search_match = _SEARCH_TAG_RE.search(reply_text)
+            image_match = _IMAGE_TAG_RE.search(reply_text)
 
-                # Execute each requested tool.
-                for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    try:
-                        fn_args = json.loads(tc["function"]["arguments"])
-                    except json.JSONDecodeError:
-                        fn_args = {}
+            if not search_match and not image_match:
+                # No tools requested — return as-is.
+                return reply_text.strip(), image_urls
 
-                    if fn_name == "web_search":
-                        query = fn_args.get("query", "")
-                        logger.info("  → web_search(%r)", query)
-                        tool_result = await self.web_search(query, premium=premium)
+            # --- Execute IMAGE tool (doesn't need a re-call) ---
+            if image_match:
+                img_prompt = image_match.group(1).strip()
+                logger.info("Tool tag detected: <<IMAGE>> %r", img_prompt[:80])
+                url = await self.generate_image(img_prompt, premium=premium)
+                if url and url.startswith("http"):
+                    image_urls.append(url)
+                    logger.info("  → Image generated: %s", url)
+                else:
+                    logger.warning("  → Image generation failed for: %s", img_prompt[:80])
+                # Remove the IMAGE tag from the text the user sees.
+                reply_text = _IMAGE_TAG_RE.sub("", reply_text).strip()
 
-                    elif fn_name == "generate_image":
-                        prompt = fn_args.get("prompt", "")
-                        logger.info("  → generate_image(%r)", prompt[:80])
-                        url = await self.generate_image(prompt, premium=premium)
-                        if url and url.startswith("http"):
-                            image_urls.append(url)
-                            tool_result = f"Image generated successfully. URL: {url}"
-                        else:
-                            tool_result = (
-                                "Image generation failed. Let the user know and "
-                                "suggest they try `/image` directly."
-                            )
-                    else:
-                        tool_result = f"Unknown tool: {fn_name}"
+            # --- Execute SEARCH tool (needs a re-call for the model to use results) ---
+            if search_match:
+                search_query = search_match.group(1).strip()
+                logger.info("Tool tag detected: <<SEARCH>> %r", search_query)
+                search_results = await self.web_search(search_query, premium=premium)
 
-                    # Feed the tool result back to the model.
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result,
-                    })
+                # Clean the tags out of the assistant's message.
+                clean_reply = _SEARCH_TAG_RE.sub("", reply_text)
+                clean_reply = _IMAGE_TAG_RE.sub("", clean_reply).strip()
 
-                # Update payload and loop back for the model's next response.
+                # Add the assistant's (cleaned) message + search results to history.
+                messages.append({"role": "assistant", "content": clean_reply})
+                messages.append({
+                    "role": "system",
+                    "content": SEARCH_INJECTION_PROMPT.format(results=search_results),
+                })
                 payload["messages"] = messages
-                continue
+                logger.info("  → Search done, re-calling %s for final answer…", provider)
+                continue  # Loop back to get the model's final answer.
 
-            # No tool calls (or max rounds hit) — return the final text.
-            return msg.get("content") or "", image_urls
+            # If we only had IMAGE (no search), return now.
+            return reply_text.strip(), image_urls
 
-        # Safety: shouldn't normally reach here.
+        # Safety fallback.
         return "⚠️ I ran into an issue processing your request. Please try again.", image_urls
 
     # ─── Web Search (Old-LLM API → Gemini with built-in search) ───
